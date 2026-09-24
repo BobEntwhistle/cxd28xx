@@ -1612,13 +1612,23 @@ err:
 
 /* -------- HELENE (CXD2858ER) tuner -------- */
 
+/* RFIN matching for terrestrial: 0x05, +0x02 when the TER LNA is fitted */
+static u8 helene_terr_rfin(struct cxd2878_dev *dev)
+{
+	return 0x05 | (dev->base->config->helene_ter_lna ? 0x02 : 0x00);
+}
+
 static int helene_init(struct cxd2878_dev *dev)
 {
 	int ret = 0;
 	u8 tunerid = 0x00, rdata = 0x00;
 	u8 data[20];
+	u8 xosc_load = dev->base->config->helene_xosc_load ?
+		       dev->base->config->helene_xosc_load : 0x33;
 
 	dev_dbg(&dev->base->i2c->dev, "%s: helene_init\n", KBUILD_MODNAME);
+
+	dev->helene_mode = HELENE_MODE_NONE;
 
 	ret = cxd2878_rdm(dev, dev->tuner_addr, 0x7F, &tunerid, 1);
 	if (ret)
@@ -1628,7 +1638,7 @@ static int helene_init(struct cxd2878_dev *dev)
 	/* x_pon */
 	cxd2878_wr(dev, dev->tuner_addr, 0x01, 0x00);
 	cxd2878_wr(dev, dev->tuner_addr, 0x67, 0x00);
-	cxd2878_wr(dev, dev->tuner_addr, 0x43, 0x06);
+	cxd2878_wr(dev, dev->tuner_addr, 0x43, helene_terr_rfin(dev));
 
 	u8 pwr[3] = {0x15, 0x00, 0x00};
 	cxd2878_wrm(dev, dev->tuner_addr, 0x5E, pwr, 3);
@@ -1649,7 +1659,7 @@ static int helene_init(struct cxd2878_dev *dev)
 		break;
 	}
 	data[1] = 0x84;   /* XOSC driver current */
-	data[2] = 0xB3;   /* XOSC load capacitance */
+	data[2] = 0x80 | (xosc_load & 0x3F);   /* XOSC load capacitance */
 	data[3] = 0x00;   /* REFOUT disabled */
 	data[4] = 0x00;   /* GPIO0 */
 	data[5] = 0x00;   /* GPIO1 */
@@ -1678,8 +1688,10 @@ static int helene_init(struct cxd2878_dev *dev)
 
 	/* Check CPU_STT */
 	cxd2878_rdm(dev, dev->tuner_addr, 0x1A, &rdata, 1);
-	if (rdata != 0x00)
+	if (rdata != 0x00) {
+		ret = -EIO;
 		goto err;
+	}
 
 	/* VCO current setting */
 	cxd2878_wr(dev, dev->tuner_addr, 0x17, 0x90);
@@ -1706,9 +1718,77 @@ err:
 	return ret;
 }
 
-static int helene_tune_terr(struct cxd2878_dev *dev, u32 frequencykHz)
+/* Leave terrestrial mode. Caller holds i2c_lock with the repeater open. */
+static int helene_stop_terr(struct cxd2878_dev *dev)
 {
 	int ret;
+	u8 data[3] = {0x15, 0x00, 0x00};
+
+	ret = cxd2878_wr(dev, dev->tuner_addr, 0x74, 0x02);
+	if (ret)
+		return ret;
+	ret = cxd2878_SetRegisterBits(dev, dev->tuner_addr, 0x67, 0x00, 0xFE);
+	if (ret)
+		return ret;
+	ret = cxd2878_wrm(dev, dev->tuner_addr, 0x5E, data, 3);
+	if (ret)
+		return ret;
+	ret = cxd2878_wr(dev, dev->tuner_addr, 0x88, 0x00);
+	if (ret)
+		return ret;
+	ret = cxd2878_wr(dev, dev->tuner_addr, 0x87, 0xC0);
+	if (ret)
+		return ret;
+
+	dev->helene_mode = HELENE_MODE_NONE;
+	return 0;
+}
+
+/* Leave satellite mode. Caller holds i2c_lock with the repeater open. */
+static int helene_stop_sat(struct cxd2878_dev *dev)
+{
+	int ret;
+	u8 data[3] = {0x14, 0x00, 0x00};
+
+	ret = cxd2878_wr(dev, dev->tuner_addr, 0x15, 0x02);
+	if (ret)
+		return ret;
+	ret = cxd2878_wr(dev, dev->tuner_addr, 0x43, helene_terr_rfin(dev));
+	if (ret)
+		return ret;
+	ret = cxd2878_wrm(dev, dev->tuner_addr, 0x0C, data, 3);
+	if (ret)
+		return ret;
+	ret = cxd2878_wr(dev, dev->tuner_addr, 0x01, 0x00);
+	if (ret)
+		return ret;
+	ret = cxd2878_wr(dev, dev->tuner_addr, 0x05, 0x00);
+	if (ret)
+		return ret;
+	ret = cxd2878_wr(dev, dev->tuner_addr, 0x04, 0xC0);
+	if (ret)
+		return ret;
+
+	dev->helene_mode = HELENE_MODE_NONE;
+	return 0;
+}
+
+/* Stop whichever tuner mode is active. Caller holds i2c_lock, repeater open. */
+static int helene_stop(struct cxd2878_dev *dev)
+{
+	switch (dev->helene_mode) {
+	case HELENE_MODE_TERR:
+		return helene_stop_terr(dev);
+	case HELENE_MODE_SAT:
+		return helene_stop_sat(dev);
+	default:
+		return 0;
+	}
+}
+
+static int helene_tune_terr(struct cxd2878_dev *dev, u32 frequencykHz)
+{
+	int ret = -EINVAL;
 	enum sony_freia_tv_system_t tvSystem;
 	u8 ref_r;
 	int is_cable;
@@ -1818,6 +1898,12 @@ static int helene_tune_terr(struct cxd2878_dev *dev, u32 frequencykHz)
 		    tvSystem == SONY_FREIA_DTV_DVBC2_8 ||
 		    tvSystem == SONY_FREIA_DTV_SKP_OPT);
 
+	if (dev->helene_mode == HELENE_MODE_SAT) {
+		ret = helene_stop_sat(dev);
+		if (ret)
+			goto err;
+	}
+
 	/* Terrestrial mode */
 	ret = cxd2878_wr(dev, dev->tuner_addr, 0x01, 0x00);
 	if (ret)
@@ -1843,8 +1929,8 @@ static int helene_tune_terr(struct cxd2878_dev *dev, u32 frequencykHz)
 	}
 	cxd2878_wrm(dev, dev->tuner_addr, 0x91, ana, 2);
 
-	/* Internal loop filter: enabled for terrestrial, disabled for cable */
-	cxd2878_wr(dev, dev->tuner_addr, 0x9C, is_cable ? 0x00 : 0x90);
+	/* Loop filter select: 0x00 for ISDB-T */
+	cxd2878_wr(dev, dev->tuner_addr, 0x9C, 0x00);
 
 	/* Local polarity — upper local for all HELENE terrestrial */
 	cxd2878_wr(dev, dev->tuner_addr, 0x9D, 0x00);
@@ -1870,11 +1956,11 @@ static int helene_tune_terr(struct cxd2878_dev *dev, u32 frequencykHz)
 
 	/* Loop filter settings (0x63-0x66) */
 	if (!is_cable) {
-		/* Internal loop filter */
-		endata[5] = 0x38; /* 0x63 */
-		endata[6] = 0x1E; /* 0x64 */
-		endata[7] = 0x02; /* 0x65 */
-		endata[8] = 0x24; /* 0x66 */
+		/* External loop filter */
+		endata[5] = 0xB4; /* 0x63 */
+		endata[6] = 0x78; /* 0x64 */
+		endata[7] = 0x08; /* 0x65 */
+		endata[8] = 0x30; /* 0x66 */
 	} else {
 		endata[5] = 0x1C; /* 0x63 */
 		endata[6] = 0x78; /* 0x64 */
@@ -1946,6 +2032,7 @@ static int helene_tune_terr(struct cxd2878_dev *dev, u32 frequencykHz)
 	cxd2878_wr(dev, dev->tuner_addr, 0x88, 0x00);
 	cxd2878_wr(dev, dev->tuner_addr, 0x87, 0xC0);
 
+	dev->helene_mode = HELENE_MODE_TERR;
 	return 0;
 
 err:
@@ -1961,6 +2048,12 @@ static int helene_tune_sat(struct cxd2878_dev *dev, u32 frequencykHz,
 	u8 data[18];
 	u32 freq_4khz = (frequencykHz + 2) / 4;
 	u8 lpf;
+
+	if (dev->helene_mode == HELENE_MODE_TERR) {
+		ret = helene_stop_terr(dev);
+		if (ret)
+			goto err;
+	}
 
 	/* Disable IQ output */
 	cxd2878_wr(dev, dev->tuner_addr, 0x15, 0x02);
@@ -1997,13 +2090,13 @@ static int helene_tune_sat(struct cxd2878_dev *dev, u32 frequencykHz,
 		break;
 	}
 
-	data[3] = 0x80; /* 0x07: internal loop filter */
+	data[3] = 0x00; /* 0x07: external loop filter */
 
 	/* Loop filter settings */
-	data[4] = 0x70; /* 0x08 */
-	data[5] = 0x1E; /* 0x09 */
-	data[6] = 0x02; /* 0x0A */
-	data[7] = 0x24; /* 0x0B */
+	data[4] = 0xB4; /* 0x08 */
+	data[5] = 0x78; /* 0x09 */
+	data[6] = 0x08; /* 0x0A */
+	data[7] = 0x30; /* 0x0B */
 
 	/* Enable for analog block */
 	data[8] = 0xFF;  /* 0x0C: SAT_LNA ON */
@@ -2045,6 +2138,7 @@ static int helene_tune_sat(struct cxd2878_dev *dev, u32 frequencykHz,
 	cxd2878_wr(dev, dev->tuner_addr, 0x05, 0x00);
 	cxd2878_wr(dev, dev->tuner_addr, 0x04, 0xC0);
 
+	dev->helene_mode = HELENE_MODE_SAT;
 	return 0;
 err:
 	dev_err(&dev->base->i2c->dev, "%s: HELENE sat tune error!\n",
@@ -2217,7 +2311,12 @@ static int cxd2878_setTSClkModeAndFreq(struct cxd2878_dev *dev)
 		cxd2878_SetRegisterBits(dev,dev->slvt, 0xDA, tsClkManualOn, 0x01);
 	}
 
-	if (serialTS & 0x80) {
+	if ((serialTS & 0x80) && dev->base->config->ts_ser_half_rate) {
+		/* Serial TS, gated half rate: low freq for ISDB-T, high otherwise */
+		tsClkConfiguration = serialTSClkSettings[0][
+			(dev->system == SONY_DTV_SYSTEM_ISDBT) ? 5 : 3];
+	}
+	else if (serialTS & 0x80) {
 		/* Serial TS */
 		/* Intentional fall through */
 		tsClkConfiguration = serialTSClkSettings[1][1];
@@ -2325,7 +2424,8 @@ static int cxd2878_setTSClkModeAndFreq(struct cxd2878_dev *dev)
 	 * <SLV-T>  95h     11h     [7:0]    0x60     0x5C    OREG_CKG_RATE_NUMER[7:0]
 	 * <SLV-T>  02h     E7h     [0]      1'b0     1'b1    OWFMT_TIMER_OFF
 	 */
-	{
+	/* CXD2856 has no ATSC 3.0 core: banks 0x95/0x02 do not apply */
+	if (!SONY_TUNER_IS_HELENE(dev->chipid)) {
 		u8 data = 0x60;
 		u8 data2 = 0x00;
 		if(dev->system == SONY_DTV_SYSTEM_ATSC3 && dev->atsc3Output == SONY_DEMOD_OUTPUT_ATSC3_ALP_DIV_TS) {
@@ -2676,6 +2776,8 @@ static int cxd2878_sleep(struct cxd2878_dev *dev)
 		   cxd2878_wr(dev,dev->slvt,0xDE,0x03);
 		   cxd2878_wr(dev,dev->slvt,0x00,0x17);
 		   u8 data0[2] = {0x01,0x02};
+		   if (SONY_TUNER_IS_HELENE(dev->chipid))
+			   data0[1] = 0x00;	/* CXD2856 */
 		   cxd2878_wrm(dev,dev->slvt,0x38,data0,2);
 		   cxd2878_wr(dev,dev->slvt,0x00,0x1E);
 		   cxd2878_wr(dev,dev->slvt,0x73,0x00);
@@ -3605,13 +3707,17 @@ static int SLtoAIT_BandSetting(struct cxd2878_dev *dev)
 		  cxd2878_wr(dev,dev->slvt,0xBE,2);
 		 break;
 	case SONY_DTV_BW_6_MHZ:
+		  if (SONY_TUNER_IS_HELENE(dev->chipid))
+			  nominalRate_6[2] = 0x80;	/* CXD2856 */
 		  cxd2878_wrm(dev,dev->slvt,0x9F,nominalRate_6,5);
 		  cxd2878_wrm(dev,dev->slvt,0xA6,itbCoef_6,14);
 		  data[0] = (u8) ((dev->iffreqConfig.configISDBT_6 >> 16) & 0xFF);
           data[1] = (u8) ((dev->iffreqConfig.configISDBT_6 >> 8) & 0xFF);
           data[2] = (u8) (dev->iffreqConfig.configISDBT_6 & 0xFF);
 	 	  cxd2878_wrm(dev,dev->slvt,0xB6,data,3);
-		  cxd2878_wr(dev,dev->slvt,0xD7,0x00);
+		  /* CXD2856+HELENE uses 0x04 */
+		  cxd2878_wr(dev,dev->slvt,0xD7,
+			     SONY_TUNER_IS_HELENE(dev->chipid) ? 0x04 : 0x00);
 		  dataxd9[0]=0x1F;
 		  dataxd9[1]=0x79;
 		  cxd2878_wrm(dev,dev->slvt,0xD9,dataxd9,2);
@@ -3705,6 +3811,8 @@ static int cxd2878_set_isdbt(struct dvb_frontend *fe)
 	if(dev->base->config->LED_switch)
 		dev->base->config->LED_switch(dev->base->i2c,5);
 
+	if (SONY_TUNER_IS_HELENE(dev->chipid) && !c->bandwidth_hz)
+		c->bandwidth_hz = 6000000;	/* Japan ISDB-T */
 	dev->bandwidth = (enum sony_dtv_bandwidth_t)(c->bandwidth_hz/1000000);
     if ((dev->state == SONY_DEMOD_STATE_ACTIVE) && (dev->system == SONY_DTV_SYSTEM_ISDBT)) {
         /* Demodulator Active and set to ISDB-T mode */
@@ -3865,8 +3973,6 @@ static int SLtoAIS(struct cxd2878_dev *dev)
 	cxd2878_wr(dev, dev->slvx, 0x17, 0x0C);
 
 	cxd2878_wr(dev, dev->slvt, 0x00, 0x00);
-	/* RFAGC soft reset off */
-	cxd2878_wr(dev, dev->slvt, 0x20, 0x01);
 	/* Disable S/S2 auto detection */
 	cxd2878_wr(dev, dev->slvt, 0x2D, 0x00);
 	/* Set TS/TLV mode */
@@ -3880,8 +3986,11 @@ static int SLtoAIS(struct cxd2878_dev *dev)
 	cxd2878_wr(dev, dev->slvt, 0x6A, 0x00);
 	cxd2878_wr(dev, dev->slvx, 0x18, 0x00);
 
-	/* Parity setting */
 	cxd2878_wr(dev, dev->slvt, 0x00, 0x00);
+	/* RFAGC soft reset off */
+	cxd2878_wr(dev, dev->slvt, 0x20, 0x01);
+
+	/* Parity setting */
 	u8 parity[2] = {0x00, 0x00};
 	cxd2878_wrm(dev, dev->slvt, 0xCE, parity, 2);
 
@@ -3903,6 +4012,35 @@ static int SLtoAIS(struct cxd2878_dev *dev)
 err:
 	dev_err(&dev->base->i2c->dev, "%s: SLtoAIS error!\n", KBUILD_MODNAME);
 	return ret;
+}
+
+/*
+ * ISDB-S stream selection: stream_id 0-7 selects a relative TS slot,
+ * >= 12 selects a TSID.
+ */
+static int cxd2878_isdbs_set_stream(struct cxd2878_dev *dev, u32 stream_id)
+{
+	u8 data[3];
+
+	if (stream_id == NO_STREAM_ID_FILTER)
+		stream_id = 0;
+
+	if (stream_id < 8) {
+		/* Relative TS number (slot) */
+		data[0] = 0x00;
+		data[1] = (u8)stream_id;
+		data[2] = 0x01;
+	} else if (stream_id >= 12 && stream_id <= 0xFFFF) {
+		/* TSID */
+		data[0] = (stream_id >> 8) & 0xFF;
+		data[1] = stream_id & 0xFF;
+		data[2] = 0x00;
+	} else {
+		return -EINVAL;
+	}
+
+	cxd2878_wr(dev, dev->slvt, 0x00, 0xC0);
+	return cxd2878_wrm(dev, dev->slvt, 0xE9, data, 3);
 }
 
 static int cxd2878_set_isdbs(struct dvb_frontend *fe)
@@ -3929,18 +4067,17 @@ static int cxd2878_set_isdbs(struct dvb_frontend *fe)
 		if (ret)
 			goto err;
 	} else {
+		ret = -EINVAL;
 		goto err;
 	}
 
-	/* TSID selection */
-	if (c->stream_id != NO_STREAM_ID_FILTER && c->stream_id != 0) {
-		cxd2878_wr(dev, dev->slvt, 0x00, 0xC0);
-		cxd2878_wr(dev, dev->slvt, 0xE9, (c->stream_id >> 8) & 0xFF);
-		cxd2878_wr(dev, dev->slvt, 0xEA, c->stream_id & 0xFF);
-		cxd2878_wr(dev, dev->slvt, 0xEB, 0x00); /* TSID mode */
-	}
-
 	dev->state = SONY_DEMOD_STATE_ACTIVE;
+
+	/* TS slot / TSID selection, before tuning */
+	ret = cxd2878_isdbs_set_stream(dev, c->stream_id);
+	if (ret)
+		goto err;
+
 	return 0;
 err:
 	dev_err(&dev->base->i2c->dev, "%s: set ISDB-S error!\n", KBUILD_MODNAME);
@@ -4762,55 +4899,63 @@ static void cxd2878_lock_flag(struct cxd2878_dev *dev,bool enable)
 
 	return;
 }
-static int cxd2878_init(struct dvb_frontend *fe)
+/* CXD2856 TS output setup: TSVALID/TSSYNC masks and TS enable */
+static void cxd2856_ts_output_init(struct cxd2878_dev *dev)
+{
+	cxd2878_SetBankAndRegisterBits(dev, dev->slvt, 0x00, 0xC5, 0x01, 0x01);
+	cxd2878_SetBankAndRegisterBits(dev, dev->slvt, 0x00, 0xC8, 0x03, 0x1F);
+	cxd2878_SetBankAndRegisterBits(dev, dev->slvt, 0x00, 0xC9, 0x03, 0x1F);
+	cxd2878_SetBankAndRegisterBits(dev, dev->slvt, 0xA0, 0xB9, 0x01, 0x01);
+}
+
+/* Caller must hold dev->base->i2c_lock */
+static int __cxd2878_init(struct dvb_frontend *fe)
 {
 	struct cxd2878_dev*dev = fe->demodulator_priv;
 	struct dtv_frontend_properties *c = &fe->dtv_property_cache;
 
 	int ret;
 
-	mutex_lock(&dev->base->i2c_lock);
-
 	if(dev->warm)
 		goto warm_start;
-	
+
 	if (SONY_TUNER_IS_ASCOT3(dev->chipid) || SONY_TUNER_IS_FRIEA(dev->chipid)) {
 		/* Clear all registers */
 		ret = cxd2878_wr(dev,dev->slvx,0x02,0x00);
-		if(ret) return ret;
+		if(ret) goto err;
 
 		/* Wait for oscillator stabilization */
 		msleep(4);
 
 		/* Set SLV-X Bank : 0x00 */
 		ret = cxd2878_wr(dev,dev->slvx,0x00,0x00);
-		if(ret) return ret;
+		if(ret) goto err;
 
 		/* Initial setting for crystal oscillator */
 		ret = cxd2878_wr(dev,dev->slvx,0x1D,0x00);
-		if(ret) return ret;
+		if(ret) goto err;
 
 		/* Clock mode setting */
 		ret = cxd2878_wr(dev,dev->slvx,0x14,dev->base->config->xtal);
-		if(ret) return ret;
+		if(ret) goto err;
 
 		/* Wait for oscillator stabilization */
 		msleep(1);
 
 		/* Initialize setting */
 		ret = cxd2878_wr(dev,dev->slvx,0x50,0x00);
-		if(ret) return ret;
+		if(ret) goto err;
 
 		if(dev->base->config->atscCoreDisable) {
 			/* ATSC 1.0 core disable setting */
 			ret = cxd2878_wr(dev,dev->slvx,0x90,0x00);
-			if(ret) return ret;
+			if(ret) goto err;
 			msleep(1);
 		}
 
 		/* Negate XSRST */
 		ret = cxd2878_wr(dev,dev->slvx,0x10,0x00);
-		if(ret) return ret;
+		if(ret) goto err;
 
 		if(dev->base->config->atscCoreDisable)
 			msleep(1);
@@ -4892,11 +5037,17 @@ static int cxd2878_init(struct dvb_frontend *fe)
 		freia_init(dev);
 	}
 	else if (SONY_TUNER_IS_HELENE(dev->chipid)) {
-		helene_init(dev);
+		ret = helene_init(dev);
+		if (ret) {
+			cxd2878_i2c_repeater(dev,0);
+			goto err;
+		}
 	}
 	else {
 		dev_info(&dev->base->i2c->dev, "Unknown chipid %x", dev->chipid);
-		return -ENOTSUPP;
+		cxd2878_i2c_repeater(dev,0);
+		ret = -ENOTSUPP;
+		goto err;
 	}
 
 	cxd2878_i2c_repeater(dev,0);
@@ -4906,7 +5057,8 @@ static int cxd2878_init(struct dvb_frontend *fe)
 	//set the ts mode
 
     cxd2878_SetBankAndRegisterBits(dev,dev->slvt, 0x00, 0xC4,  (dev->base->config->ts_mode? 0x00 : 0x80), 0x80);
-    cxd2878_SetBankAndRegisterBits(dev,dev->slvt, 0x02, 0xE4,  ((dev->base->config->ts_mode == 2) ? 0x01 : 0x00), 0x01);
+    if (!SONY_TUNER_IS_HELENE(dev->chipid))	/* no ALP/TLV bank 0x02 on CXD2856 */
+     cxd2878_SetBankAndRegisterBits(dev,dev->slvt, 0x02, 0xE4,  ((dev->base->config->ts_mode == 2) ? 0x01 : 0x00), 0x01);
     if(dev->base->config->ts_mode==0){
 		cxd2878_SetBankAndRegisterBits(dev,dev->slvt,0x00, 0xC4,  (dev->base->config->ts_ser_data ? 0x08 : 0x00), 0x08);
 		cxd2878_SetBankAndRegisterBits(dev,dev->slvt,0x00, 0xC4, 0x00, 0x10);
@@ -4923,6 +5075,8 @@ static int cxd2878_init(struct dvb_frontend *fe)
      cxd2878_SetBankAndRegisterBits(dev,dev->slvt,0x00, 0x96, 0x54, 0xff);
      cxd2878_SetBankAndRegisterBits(dev,dev->slvt,0x00, 0x97, 0x54, 0xff);
 
+	if (SONY_TUNER_IS_HELENE(dev->chipid))
+		cxd2856_ts_output_init(dev);
 
     if(dev->base->config->lock_flag)//for usb device led light
     {
@@ -4939,12 +5093,21 @@ warm_start:
 	c->post_bit_count.len = 1;
 	c->post_bit_count.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
 
-	mutex_unlock(&dev->base->i2c_lock);
-
 	return 0;
 err:
-	mutex_unlock(&dev->base->i2c_lock);
 	dev_err(&dev->base->i2c->dev,"%s:Init failed!",KBUILD_MODNAME);
+
+	return ret;
+}
+
+static int cxd2878_init(struct dvb_frontend *fe)
+{
+	struct cxd2878_dev *dev = fe->demodulator_priv;
+	int ret;
+
+	mutex_lock(&dev->base->i2c_lock);
+	ret = __cxd2878_init(fe);
+	mutex_unlock(&dev->base->i2c_lock);
 
 	return ret;
 }
@@ -4961,6 +5124,7 @@ static int cxd2878_read_status(struct dvb_frontend *fe,
 	u8 tmp[2],qam = 0;
 	u16 tmp16 = 0;
 	s32  rflevel,snr=0,rflevel_dBm=0;
+	s32 cnr_ofs = 1500;
 
 	mutex_lock(&dev->base->i2c_lock);
 
@@ -5024,6 +5188,15 @@ static int cxd2878_read_status(struct dvb_frontend *fe,
 						FE_HAS_SYNC | FE_HAS_LOCK;
 			else
 				*status = FE_HAS_SIGNAL | FE_HAS_CARRIER;
+			break;
+		case SYS_ISDBS:
+			ifout = 0;
+			/* <SLV-T> A0h 12h [6] TS lock */
+			cxd2878_wr(dev,dev->slvt,0x00,0xA0);
+			cxd2878_rdm(dev,dev->slvt,0x12,&data,1);
+			if (data & 0x40)
+				*status = FE_HAS_SIGNAL | FE_HAS_CARRIER | FE_HAS_VITERBI |
+						FE_HAS_SYNC | FE_HAS_LOCK;
 			break;
 		case SYS_ATSC:
 			ifout = 500;
@@ -5109,6 +5282,12 @@ static int cxd2878_read_status(struct dvb_frontend *fe,
 	}
 
 	/*rf signal*/
+	if (SONY_TUNER_IS_HELENE(dev->chipid)) {
+		/* No HELENE RSSI readout; avoid repeater toggling on the shared bus */
+		c->strength.len = 1;
+		c->strength.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
+		goto rf_done;
+	}
 	ret |= cxd2878_i2c_repeater(dev,1);
 	if(SONY_TUNER_IS_ASCOT3(dev->chipid))
 		ret |= ascot3_read_rssi(dev,c->frequency/1000,&rflevel); //unit khz
@@ -5137,6 +5316,7 @@ static int cxd2878_read_status(struct dvb_frontend *fe,
 	else
 		c->strength.stat[1].svalue = 10;   //no signal or very weak signal
 
+rf_done:
 	c->cnr.len =1;
 	c->cnr.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
 
@@ -5301,6 +5481,22 @@ static int cxd2878_read_status(struct dvb_frontend *fe,
 			tmp16 = tmp[0]<<8 |tmp[1];
 			snr = 100*(s32)sony_math_log10(tmp16) - 9031;
 		  	break;
+		  case SYS_ISDBS:
+		  {
+			int i;
+
+			/* <SLV-T> A1h 10h-12h: CNR valid flag + 13-bit value */
+			cxd2878_wr(dev,dev->slvt,0x00,0xA1);
+			cxd2878_rdm(dev,dev->slvt,0x10,tmp1,3);
+			tmp16 = (tmp1[0] & 0x01) ?
+				(((tmp1[1] & 0x1F) << 8) | tmp1[2]) : 0x05AF;
+			for (i = 0; i < ARRAY_SIZE(isdbs_cn_data) - 1; i++)
+				if (tmp16 >= isdbs_cn_data[i].value)
+					break;
+			snr = isdbs_cn_data[i].cnr_x1000;
+			cnr_ofs = 0;	/* table is already calibrated */
+			break;
+		  }
 		  case SYS_ATSC3:
 			cxd2878_wr(dev,dev->slvt,0x00,0x90);
 			cxd2878_rdm(dev,dev->slvt,0x28,tmp1,3);
@@ -5321,10 +5517,10 @@ static int cxd2878_read_status(struct dvb_frontend *fe,
 		}
 		c->cnr.len = 2;
 		c->cnr.stat[0].scale = FE_SCALE_DECIBEL;
-		c->cnr.stat[0].uvalue = snr-1500;
+		c->cnr.stat[0].uvalue = snr-cnr_ofs;
 		c->cnr.stat[1].scale = FE_SCALE_RELATIVE;
-		c->cnr.stat[1].uvalue = (30-((snr-1500)/1000))*10;
-		c->cnr.stat[1].uvalue = min(max((snr-1500)/1000*24/10,0),100)*656;
+		c->cnr.stat[1].uvalue = (30-((snr-cnr_ofs)/1000))*10;
+		c->cnr.stat[1].uvalue = min(max((snr-cnr_ofs)/1000*24/10,0),100)*656;
 		if(c->cnr.stat[1].uvalue>0xffff)
 			c->cnr.stat[1].uvalue = 0xffff;
 
@@ -5486,8 +5682,11 @@ static int cxd2878_set_frontend(struct dvb_frontend *fe)
 
 		mutex_lock(&dev->base->i2c_lock);
 
-	if(!dev->warm)
-	    cxd2878_init(fe);
+	if(!dev->warm) {
+		ret = __cxd2878_init(fe);
+		if(ret)
+			goto err;
+	}
 
 	if(dev->base->config->RF_switch)
 		dev->base->config->RF_switch(dev->base->i2c,dev->base->config->rf_port,1);
@@ -5515,6 +5714,11 @@ static int cxd2878_set_frontend(struct dvb_frontend *fe)
 		case SYS_ISDBT:
 			ret = cxd2878_set_isdbt(fe);
 			break;
+		case SYS_ISDBS:
+			ret = cxd2878_set_isdbs(fe);
+			if (ret)
+				goto err;
+			break;
 		case SYS_ATSC:
 			ret = cxd2878_set_atsc(fe);
 			break;
@@ -5531,6 +5735,13 @@ static int cxd2878_set_frontend(struct dvb_frontend *fe)
 		ret |= ascot3_tune(dev,c->frequency/1000); //unit khz
 	else if(SONY_TUNER_IS_FRIEA(dev->chipid))
 		ret |= freia_tune(dev,c->frequency/1000); //unit khz
+	else if(SONY_TUNER_IS_HELENE(dev->chipid)) {
+		if(c->delivery_system == SYS_ISDBS)
+			/* satellite frequency is already in kHz */
+			ret |= helene_tune_sat(dev,c->frequency,28860);
+		else
+			ret |= helene_tune_terr(dev,c->frequency/1000); //unit khz
+	}
 
 	ret |= cxd2878_i2c_repeater(dev,0);
 	if(c->delivery_system!=SYS_ATSC)
@@ -5673,6 +5884,12 @@ static int cxd2878_sleep_fe(struct dvb_frontend *fe)
 	struct cxd2878_dev *dev = fe->demodulator_priv;
 
 	mutex_lock(&dev->base->i2c_lock);
+	if (SONY_TUNER_IS_HELENE(dev->chipid) &&
+	    dev->helene_mode != HELENE_MODE_NONE) {
+		cxd2878_i2c_repeater(dev, 1);
+		helene_stop(dev);
+		cxd2878_i2c_repeater(dev, 0);
+	}
 	if (dev->base->config->lock_flag)
 		cxd2878_lock_flag(dev, 0);
 	cxd2878_sleep(dev);
@@ -5833,6 +6050,9 @@ struct dvb_frontend*cxd2878_attach(const struct cxd2878_config*config,
 	id = ((data[0] & 0x03) << 8) | data[1];
 
 	switch(id){
+		case SONY_DEMOD_CHIP_ID_CXD2856 :  /**< CXD2856 / CXD6800(SiP) */
+			dev_info(&i2c->dev,"Detect CXD2856/CXD6800(SiP) chip.");
+			break;
 		case SONY_DEMOD_CHIP_ID_CXD2857 :  /**< CXD2857 */
 			dev_info(&i2c->dev,"Detect CXD2857 chip.");
 			break;
@@ -5850,17 +6070,34 @@ struct dvb_frontend*cxd2878_attach(const struct cxd2878_config*config,
 			break;
 		default:
 		case SONY_DEMOD_CHIP_ID_UNKNOWN: /**< Unknown */
-			dev_err(&i2c->dev,"%s:Can not detect the chip.\n",KBUILD_MODNAME);
+			dev_err(&i2c->dev,"%s:Can not detect the chip (id 0x%03x).\n",
+				KBUILD_MODNAME,id);
 			goto err1;
 			break;
 	}
 	dev->chipid = id;
+
+	if (SONY_TUNER_IS_HELENE(dev->chipid)) {
+		/* CXD2856/7 + HELENE: Japanese ISDB-T and ISDB-S */
+		memset(dev->fe.ops.delsys, 0, sizeof(dev->fe.ops.delsys));
+		dev->fe.ops.delsys[0] = SYS_ISDBT;
+		dev->fe.ops.delsys[1] = SYS_ISDBS;
+		dev->fe.ops.info.frequency_min_hz = 42 * MHz;
+		dev->fe.ops.info.frequency_max_hz = 2071 * MHz;
+	}
 
 	dev_dbg(&i2c->dev,"%s: attaching frontend successfully.\n",KBUILD_MODNAME);
 
 	return &dev->fe;
 
 err1:
+	/* Drop our reference on the shared base; free it if we created it */
+	if (dev->base) {
+		if (--dev->base->count == 0) {
+			list_del(&dev->base->cxdlist);
+			kfree(dev->base);
+		}
+	}
 	kfree(dev);
 err:
 	dev_err(&i2c->dev,"%s:error attaching frontend.\n",KBUILD_MODNAME);

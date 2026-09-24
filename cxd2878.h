@@ -100,7 +100,17 @@ struct cxd2878_config{
 	u8 atscCoreDisable;
 
 	enum sony_demod_output_atsc3_t atsc3_output;
-	
+
+	/*
+	 * Serial TS clock: 0 = continuous, full rate (default);
+	 * 1 = gated, half rate (CKSEL low for ISDB-T, high for ISDB-S)
+	 */
+	u8 ts_ser_half_rate;
+
+	/* HELENE (CXD2858ER) tuner options, zero = defaults */
+	u8 helene_xosc_load;	/* reg 0x83 XOSC load cap [5:0], 0 = 0x33 */
+	bool helene_ter_lna;	/* terrestrial LNA present */
+
 	bool lock_flag;  //for usb device 
 	//for ecp3 update
 	void (*write_properties) (struct i2c_adapter *i2c,u8 reg, u32 buf);
@@ -114,11 +124,6 @@ struct cxd2878_config{
 	u8 rf_port; //for change command
 	void (*TS_switch)(struct i2c_adapter * i2c,u8 flag);  //5590
 	void (*LED_switch)(struct i2c_adapter * i2c,u8 flag); //5590
-
-	/* LNB power control callback (stub — implemented next phase) */
-	int (*set_lnb)(struct i2c_adapter *i2c, int on);
-	/* Satellite virtual frontend pointer (stub — implemented next phase) */
-	struct dvb_frontend **fe_sat;
 };
 
 struct cxd2878_dev;

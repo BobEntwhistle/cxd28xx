@@ -329,6 +329,11 @@ struct sony_demod_alp_clk_configuration_t {
     u32 configJ83B_5_60;           /**< J.83B. 5.6Msps */
 } ;
 
+/* HELENE (CXD2858ER) active tuner mode */
+#define HELENE_MODE_NONE	0
+#define HELENE_MODE_TERR	1
+#define HELENE_MODE_SAT		2
+
 /* ── Device structures (shared between cxd2878_core.c and cxd2878_alp.c) ── */
 
 struct cxd_base {
@@ -354,6 +359,7 @@ struct cxd2878_dev {
 	u8 tuner_addr;
 	enum sony_demod_chip_id_t chipid;
 	enum sony_ascot3_chip_id_t tunerid;
+	u8 helene_mode;		/* HELENE_MODE_*, HELENE chips only */
 	struct sony_demod_iffreq_config_t iffreqConfig;
 
 	u32 atscNoSignalThresh;

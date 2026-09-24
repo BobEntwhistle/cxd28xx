@@ -21,6 +21,7 @@
 #include "cxd2878_priv.h"
 #include "alp.h"
 #include "it930x_smartcard.h"
+#include "compat.h"
 
 /* -------- IT930x bridge constants -------- */
 
@@ -55,6 +56,8 @@
 /* TS streaming */
 #define IT930X_URB_COUNT		8
 #define IT930X_URB_BUF_SIZE		(188 * 348)
+#define IT930X_TS_SYNC_COUNT		4	/* tags checked when resyncing */
+#define IT930X_TS_SYNC_SIZE		(188 * IT930X_TS_SYNC_COUNT)
 
 /* Bridge registers */
 #define IT930X_REG_CLK_DISABLE		0x4976
@@ -144,9 +147,17 @@ struct it930x_board_cfg {
 	u8			gpio_reset;	/* demod reset GPIO (pulse low) */
 	u8			gpio_lnb;	/* LNB power GPIO (active high), 0=none */
 	u8			gpio_always_hi;	/* GPIO set high at init, 0=none */
+	u8			gpio_post_boot_hi; /* GPIO set high after I2C config, 0=none */
 	u8			i2c_notify;	/* override 0x4975 value, 0=use demod_addr<<1 */
 	enum sony_ascot3_xtal_t	tuner_xtal;
 	u8			gpio_sc_reset;	/* smartcard reset GPIO, 0=no smartcard */
+
+	/* Demod config overrides (zero = defaults) */
+	bool			no_lock_flag;	/* demod GPIO is not a lock LED */
+	u8			ts_clk_mask;	/* 0 = 0x01 */
+	bool			ts_ser_half_rate; /* gated, half-rate serial TS clock */
+	u8			helene_xosc_load; /* HELENE reg 0x83 load cap */
+	bool			helene_ter_lna;	/* HELENE terrestrial LNA fitted */
 };
 
 /* -------- Data structures -------- */
@@ -175,6 +186,9 @@ struct it930x_fe_ctx {
 	u16			pid_table[IT930X_PID_FILTER_MAX];
 	bool			pid_filter_active;
 	int			wildcard_feeds;
+
+	/* LNB power requested by this frontend */
+	bool			lnb_on;
 
 	/* ALP */
 	struct alp_dev		*alp;
@@ -219,6 +233,11 @@ struct it930x_dev {
 	u8 *urb_bufs[IT930X_URB_COUNT];
 	dma_addr_t urb_dma[IT930X_URB_COUNT];
 	bool streaming;
+
+	/* Multi-frontend TS resync state (bytes carried across URBs) */
+	u8 ts_remain[IT930X_TS_SYNC_SIZE];
+	u32 ts_remain_len;
+	unsigned long ts_sync_drop;	/* bytes skipped while resyncing */
 
 	/* Streaming stats */
 	unsigned long urb_complete_ok;
@@ -1014,10 +1033,12 @@ static int it930x_stage_post_boot(struct it930x_dev *dev)
 			return ret;
 	}
 
-	/* GPIO11 output high (23e2:2b02 I2C bus enable / PX-MLT LNB off) */
-	ret = it930x_gpio_set(dev, 11, true);
-	if (ret)
-		return ret;
+	/* GPIO output high after I2C config (23e2:2b02: GPIO11 I2C bus enable) */
+	if (board->gpio_post_boot_hi) {
+		ret = it930x_gpio_set(dev, board->gpio_post_boot_hi, true);
+		if (ret)
+			return ret;
+	}
 
 	/* GPIO reset pulse after I2C slave config */
 	ret = it930x_gpio_pulse(dev, board->gpio_reset);
@@ -1094,6 +1115,25 @@ static int it930x_stage_ts_port_cfg(struct it930x_dev *dev)
 			return ret;
 	}
 
+	/* Multi-frontend boards: disable input ports with no frontend */
+	if (board->num_frontends > 1) {
+		u8 port;
+
+		for (port = 0; port < IT930X_MAX_FRONTENDS; port++) {
+			bool used = false;
+
+			for (i = 0; i < board->num_frontends; i++)
+				if (board->fe[i].ts_port == port)
+					used = true;
+			if (used)
+				continue;
+
+			ret = it930x_write_reg(dev, 0xda4c + port, 0x00);
+			if (ret)
+				return ret;
+		}
+	}
+
 	return it930x_write_reg(dev, IT930X_REG_TS_FAIL_IGNORE, 0x1f);
 }
 
@@ -1159,20 +1199,63 @@ static void it930x_stop_streaming(struct it930x_dev *dev);
 /* -------- TS streaming -------- */
 
 /*
- * Zero-copy TS packet routing for multi-frontend devices.
+ * TS packet routing.
  *
- * URB_BUF_SIZE = 188 * 816 guarantees packets never span URB boundaries.
- * The IT930x threshold register (0xdd88) ensures complete multiples of 188.
+ * Single frontend: the URB is handed to the demux as-is.
  *
- * For multi-frontend: each packet has a modified sync byte encoding the
- * port ID. Pattern: (sync & 0x8f) == 0x07, fe_idx = ((sync >> 4) & 7) - 1.
- * We restore 0x47 in-place — safe because the DMA buffer is overwritten
- * on the next USB transfer.
+ * Multi-frontend: each packet carries a tagged sync byte encoding the input
+ * port: (sync & 0x8f) == 0x07, fe_idx = ((sync >> 4) & 7) - 1. We restore
+ * 0x47 in-place — safe because the DMA buffer is overwritten on the next USB
+ * transfer. URB boundaries are not guaranteed to fall on packet boundaries,
+ * so on a bad tag we scan forward byte by byte until IT930X_TS_SYNC_COUNT
+ * consecutive valid tags are seen, and a partial tail is carried over to the
+ * next URB.
  */
+static inline bool it930x_ts_tag_ok(u8 s)
+{
+	return (s & 0x8f) == 0x07;
+}
+
+static void it930x_ts_route_multi(struct it930x_dev *dev, u8 **buf, u32 *len)
+{
+	u8 *p = *buf;
+	u32 remain = *len;
+
+	while (remain) {
+		u32 i;
+
+		/* Resync: need IT930X_TS_SYNC_COUNT valid tags in a row */
+		for (i = 0; i < IT930X_TS_SYNC_COUNT; i++) {
+			if ((i + 1) * 188 > remain)
+				goto out;	/* not enough data to decide */
+			if (!it930x_ts_tag_ok(p[i * 188]))
+				break;
+		}
+		if (i < IT930X_TS_SYNC_COUNT) {
+			p++;
+			remain--;
+			dev->ts_sync_drop++;
+			continue;
+		}
+
+		while (remain >= 188 && it930x_ts_tag_ok(p[0])) {
+			int fe_idx = ((p[0] & 0x70) >> 4) - 1;
+
+			if ((unsigned int)fe_idx < (unsigned int)dev->board->num_frontends) {
+				p[0] = 0x47;
+				dvb_dmx_swfilter(&dev->fes[fe_idx].demux, p, 188);
+			}
+			p += 188;
+			remain -= 188;
+		}
+	}
+out:
+	*buf = p;
+	*len = remain;
+}
+
 static void it930x_ts_route(struct it930x_dev *dev, u8 *buf, u32 len)
 {
-	u32 pos;
-
 	/* Fast path: single frontend, standard 0x47 sync */
 	if (dev->board->num_frontends == 1) {
 		struct it930x_fe_ctx *ife = &dev->fes[0];
@@ -1187,20 +1270,34 @@ static void it930x_ts_route(struct it930x_dev *dev, u8 *buf, u32 len)
 		return;
 	}
 
-	/* Multi-frontend routing */
-	for (pos = 0; pos + 188 <= len; pos += 188) {
-		u8 s = buf[pos];
-		int fe_idx;
+	/* Complete the tail carried over from the previous URB */
+	if (dev->ts_remain_len) {
+		u8 *r = dev->ts_remain;
+		u32 rlen, t = IT930X_TS_SYNC_SIZE - dev->ts_remain_len;
 
-		if ((s & 0x8f) != 0x07)
-			continue;
+		if (len < t) {
+			memcpy(dev->ts_remain + dev->ts_remain_len, buf, len);
+			dev->ts_remain_len += len;
+			return;
+		}
 
-		fe_idx = ((s & 0x70) >> 4) - 1;
-		if ((unsigned int)fe_idx >= (unsigned int)dev->board->num_frontends)
-			continue;
+		memcpy(dev->ts_remain + dev->ts_remain_len, buf, t);
+		rlen = IT930X_TS_SYNC_SIZE;
+		it930x_ts_route_multi(dev, &r, &rlen);
+		dev->ts_remain_len = 0;
 
-		buf[pos] = 0x47;
-		dvb_dmx_swfilter(&dev->fes[fe_idx].demux, buf + pos, 188);
+		/* Resume in this URB where the carry-over processing stopped */
+		if (rlen <= t) {
+			buf += t - rlen;
+			len -= t - rlen;
+		}
+	}
+
+	it930x_ts_route_multi(dev, &buf, &len);
+
+	if (len) {
+		memcpy(dev->ts_remain, buf, len);
+		dev->ts_remain_len = len;
 	}
 }
 
@@ -1276,7 +1373,9 @@ static int it930x_start_streaming(struct it930x_dev *dev)
 		     dev->urb_bufs[0], IT930X_URB_BUF_SIZE,
 		     &flush_len, 100);
 
-	/* Reset stats */
+	/* Reset resync state and stats */
+	dev->ts_remain_len = 0;
+	dev->ts_sync_drop = 0;
 	dev->urb_complete_ok = 0;
 	dev->urb_complete_err = 0;
 	dev->urb_complete_empty = 0;
@@ -1324,9 +1423,10 @@ static void it930x_stop_streaming(struct it930x_dev *dev)
 		usb_kill_urb(dev->urbs[i]);
 
 	dev_info(&dev->intf->dev,
-		 "TS streaming stopped: ok=%lu err=%lu empty=%lu bytes=%llu\n",
+		 "TS streaming stopped: ok=%lu err=%lu empty=%lu bytes=%llu sync_drop=%lu\n",
 		 dev->urb_complete_ok, dev->urb_complete_err,
-		 dev->urb_complete_empty, dev->urb_bytes_total);
+		 dev->urb_complete_empty, dev->urb_bytes_total,
+		 dev->ts_sync_drop);
 }
 
 static int it930x_alloc_urbs(struct it930x_dev *dev)
@@ -2097,11 +2197,39 @@ static const struct file_operations it930x_sc_fops = {
 
 static void it930x_alp_stop(void *priv);
 
+/* Per-frontend LNB request; it930x_set_lnb() refcounts across frontends */
+static int it930x_fe_lnb(struct it930x_fe_ctx *ife, bool on)
+{
+	int ret;
+
+	if (ife->lnb_on == on)
+		return 0;
+
+	ret = it930x_set_lnb(ife->i2c, on);
+	if (ret)
+		return ret;
+
+	ife->lnb_on = on;
+	return 0;
+}
+
+static int it930x_fe_set_voltage(struct dvb_frontend *fe,
+				 enum fe_sec_voltage voltage)
+{
+	struct it930x_fe_ctx *ife = fe->dvb->priv;
+
+	/* LNB supply is on/off only; 13 V and 18 V both mean on */
+	return it930x_fe_lnb(ife, voltage != SEC_VOLTAGE_OFF);
+}
+
 static int it930x_fe_sleep(struct dvb_frontend *fe)
 {
 	struct it930x_fe_ctx *ife = fe->dvb->priv;
 
 	it930x_alp_stop(ife);
+
+	if (ife->dev->board->gpio_lnb)
+		it930x_fe_lnb(ife, false);
 
 	if (ife->fe_ops_orig.sleep)
 		return ife->fe_ops_orig.sleep(fe);
@@ -2109,6 +2237,16 @@ static int it930x_fe_sleep(struct dvb_frontend *fe)
 }
 
 /* -------- Frontend attach -------- */
+
+static bool it930x_fe_has_delsys(struct dvb_frontend *fe, u8 sys)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(fe->ops.delsys) && fe->ops.delsys[i]; i++)
+		if (fe->ops.delsys[i] == sys)
+			return true;
+	return false;
+}
 
 static int it930x_frontend_attach(struct it930x_fe_ctx *ife)
 {
@@ -2122,16 +2260,14 @@ static int it930x_frontend_attach(struct it930x_fe_ctx *ife)
 	cfg->xtal	= SONY_DEMOD_XTAL_24000KHz;
 	cfg->tuner_addr	= fc->tuner_addr;
 	cfg->ts_clk	= 1;
-	cfg->ts_clk_mask = 1;
-	cfg->lock_flag	= 1;
+	cfg->ts_clk_mask = board->ts_clk_mask ? board->ts_clk_mask : 1;
+	cfg->lock_flag	= !board->no_lock_flag;
 	cfg->atsc3_output = SONY_DEMOD_OUTPUT_ATSC3_ALP_DIV_TS;
+	cfg->ts_ser_half_rate = board->ts_ser_half_rate;
+	cfg->helene_xosc_load = board->helene_xosc_load;
+	cfg->helene_ter_lna = board->helene_ter_lna;
 
 	cfg->tuner_xtal = board->tuner_xtal;
-
-	if (board->gpio_lnb) {
-		cfg->set_lnb	= it930x_set_lnb;
-		cfg->fe_sat	= &ife->fe_sat;
-	}
 
 	ife->fe = dvb_attach(cxd2878_attach, cfg, ife->i2c);
 	if (!ife->fe) {
@@ -2148,6 +2284,8 @@ static int it930x_frontend_attach(struct it930x_fe_ctx *ife)
 
 	ife->fe_ops_orig = ife->fe->ops;
 	ife->fe->ops.sleep = it930x_fe_sleep;
+	if (board->gpio_lnb)
+		ife->fe->ops.set_voltage = it930x_fe_set_voltage;
 
 	return 0;
 }
@@ -2361,6 +2499,8 @@ static int it930x_dvb_init(struct it930x_dev *dev)
 				i, ret);
 			goto err_unwind;
 		}
+		/* fe->dvb->priv lookup in the fe-ops overrides */
+		ife->adapter.priv = ife;
 
 		ret = it930x_frontend_attach(ife);
 		if (ret)
@@ -2414,7 +2554,7 @@ static int it930x_dvb_init(struct it930x_dev *dev)
 			goto err_dmxdev;
 
 		/* ALP virtual network adapter for ATSC 3.0 */
-		if (ife->fe) {
+		if (ife->fe && it930x_fe_has_delsys(ife->fe, SYS_ATSC3)) {
 			struct cxd2878_dev *cxd = ife->fe->demodulator_priv;
 
 			ife->alp = alp_attach(&dev->intf->dev,
@@ -2610,10 +2750,15 @@ static int it930x_probe(struct usb_interface *intf,
 		}
 	}
 
-	/* Power on backends for PX-MLT boards */
+	/*
+	 * Power on backends for PX-MLT boards: hold demod reset low, power on,
+	 * then release reset
+	 */
 	if (board->gpio_power) {
 		mutex_lock(&dev->io_lock);
-		ret = it930x_gpio_set(dev, board->gpio_power, false);
+		ret = it930x_gpio_set(dev, board->gpio_reset, false);
+		if (!ret)
+			ret = it930x_gpio_set(dev, board->gpio_power, false);
 		mutex_unlock(&dev->io_lock);
 		if (ret) {
 			dev_err(&intf->dev, "backend power-on failed (%d)\n",
@@ -2623,8 +2768,13 @@ static int it930x_probe(struct usb_interface *intf,
 		msleep(80);
 
 		mutex_lock(&dev->io_lock);
-		it930x_gpio_pulse(dev, board->gpio_reset);
+		ret = it930x_gpio_set(dev, board->gpio_reset, true);
 		mutex_unlock(&dev->io_lock);
+		if (ret) {
+			dev_err(&intf->dev, "backend reset release failed (%d)\n",
+				ret);
+			goto err_i2c;
+		}
 		msleep(20);
 	}
 
@@ -2718,124 +2868,150 @@ static const struct usb_device_id it930x_id_table[] = {
 		},
 		.gpio_reset	= 2,
 		.gpio_always_hi	= 14,
+		.gpio_post_boot_hi = 11,
 		.i2c_notify	= 0x38,
 		.tuner_xtal	= SONY_ASCOT3_XTAL_24000KHz,
 	  }
 	},
-	// { USB_DEVICE(0x0511, 0x084e), .driver_info = (kernel_ulong_t)
-	//   &(const struct it930x_board_cfg){	/* PLEX PX-MLT5U */
-	// 	.name		= "PLEX PX-MLT5U",
-	// 	.fw_file	= "it930x-firmware.bin",
-	// 	.num_frontends	= 5,
-	// 	.fe = {
-	// 		{ .ts_port = 4, .i2c_bus = 3,
-	// 		  .demod_addr = 0x65, .tuner_addr = 0x60 },
-	// 		{ .ts_port = 3, .i2c_bus = 1,
-	// 		  .demod_addr = 0x6c, .tuner_addr = 0x60 },
-	// 		{ .ts_port = 1, .i2c_bus = 1,
-	// 		  .demod_addr = 0x64, .tuner_addr = 0x60 },
-	// 		{ .ts_port = 2, .i2c_bus = 3,
-	// 		  .demod_addr = 0x6c, .tuner_addr = 0x60 },
-	// 		{ .ts_port = 0, .i2c_bus = 3,
-	// 		  .demod_addr = 0x64, .tuner_addr = 0x60 },
-	// 	},
-	// 	.gpio_power	= 7,
-	// 	.gpio_reset	= 2,
-	// 	.gpio_lnb	= 11,
-	// 	.tuner_xtal	= SONY_ASCOT3_XTAL_16000KHz,
-	// 	.gpio_sc_reset	= 14,
-	//   }
-	// },
-	// { USB_DEVICE(0x0511, 0x024e), .driver_info = (kernel_ulong_t)
-	//   &(const struct it930x_board_cfg){	/* PLEX PX-MLT5PE */
-	// 	.name		= "PLEX PX-MLT5PE",
-	// 	.fw_file	= "it930x-firmware.bin",
-	// 	.num_frontends	= 5,
-	// 	.fe = {
-	// 		{ .ts_port = 0, .i2c_bus = 3,
-	// 		  .demod_addr = 0x65, .tuner_addr = 0x60 },
-	// 		{ .ts_port = 1, .i2c_bus = 1,
-	// 		  .demod_addr = 0x6c, .tuner_addr = 0x60 },
-	// 		{ .ts_port = 2, .i2c_bus = 1,
-	// 		  .demod_addr = 0x64, .tuner_addr = 0x60 },
-	// 		{ .ts_port = 3, .i2c_bus = 3,
-	// 		  .demod_addr = 0x6c, .tuner_addr = 0x60 },
-	// 		{ .ts_port = 4, .i2c_bus = 3,
-	// 		  .demod_addr = 0x64, .tuner_addr = 0x60 },
-	// 	},
-	// 	.gpio_power	= 7,
-	// 	.gpio_reset	= 2,
-	// 	.gpio_lnb	= 11,
-	// 	.tuner_xtal	= SONY_ASCOT3_XTAL_16000KHz,
-	// 	.gpio_sc_reset	= 14,
-	//   }
-	// },
-	// { USB_DEVICE(0x0511, 0x0252), .driver_info = (kernel_ulong_t)
-	//   &(const struct it930x_board_cfg){	/* PLEX PX-MLT8PE3 */
-	// 	.name		= "PLEX PX-MLT8PE3",
-	// 	.fw_file	= "it930x-firmware.bin",
-	// 	.num_frontends	= 3,
-	// 	.fe = {
-	// 		{ .ts_port = 0, .i2c_bus = 3,
-	// 		  .demod_addr = 0x65, .tuner_addr = 0x60 },
-	// 		{ .ts_port = 3, .i2c_bus = 3,
-	// 		  .demod_addr = 0x6c, .tuner_addr = 0x60 },
-	// 		{ .ts_port = 4, .i2c_bus = 3,
-	// 		  .demod_addr = 0x64, .tuner_addr = 0x60 },
-	// 	},
-	// 	.gpio_power	= 7,
-	// 	.gpio_reset	= 2,
-	// 	.gpio_lnb	= 11,
-	// 	.tuner_xtal	= SONY_ASCOT3_XTAL_16000KHz,
-	// 	.gpio_sc_reset	= 14,
-	//   }
-	// },
-	// { USB_DEVICE(0x0511, 0x0253), .driver_info = (kernel_ulong_t)
-	//   &(const struct it930x_board_cfg){	/* PLEX PX-MLT8PE5 */
-	// 	.name		= "PLEX PX-MLT8PE5",
-	// 	.fw_file	= "it930x-firmware.bin",
-	// 	.num_frontends	= 5,
-	// 	.fe = {
-	// 		{ .ts_port = 0, .i2c_bus = 1,
-	// 		  .demod_addr = 0x65, .tuner_addr = 0x60 },
-	// 		{ .ts_port = 1, .i2c_bus = 1,
-	// 		  .demod_addr = 0x64, .tuner_addr = 0x60 },
-	// 		{ .ts_port = 2, .i2c_bus = 1,
-	// 		  .demod_addr = 0x6c, .tuner_addr = 0x60 },
-	// 		{ .ts_port = 3, .i2c_bus = 3,
-	// 		  .demod_addr = 0x6c, .tuner_addr = 0x60 },
-	// 		{ .ts_port = 4, .i2c_bus = 3,
-	// 		  .demod_addr = 0x64, .tuner_addr = 0x60 },
-	// 	},
-	// 	.gpio_power	= 7,
-	// 	.gpio_reset	= 2,
-	// 	.gpio_lnb	= 11,
-	// 	.tuner_xtal	= SONY_ASCOT3_XTAL_16000KHz,
-	// 	.gpio_sc_reset	= 14,
-	//   }
-	// },
-	// { USB_DEVICE(0x0511, 0x0254), .driver_info = (kernel_ulong_t)
-	//   &(const struct it930x_board_cfg){	/* Digibest ISDB6014 4TS */
-	// 	.name		= "Digibest ISDB6014 4TS",
-	// 	.fw_file	= "it930x-firmware.bin",
-	// 	.num_frontends	= 4,
-	// 	.fe = {
-	// 		{ .ts_port = 0, .i2c_bus = 3,
-	// 		  .demod_addr = 0x65, .tuner_addr = 0x60 },
-	// 		{ .ts_port = 1, .i2c_bus = 1,
-	// 		  .demod_addr = 0x6c, .tuner_addr = 0x60 },
-	// 		{ .ts_port = 2, .i2c_bus = 1,
-	// 		  .demod_addr = 0x64, .tuner_addr = 0x60 },
-	// 		{ .ts_port = 4, .i2c_bus = 3,
-	// 		  .demod_addr = 0x64, .tuner_addr = 0x60 },
-	// 	},
-	// 	.gpio_power	= 7,
-	// 	.gpio_reset	= 2,
-	// 	.gpio_lnb	= 11,
-	// 	.tuner_xtal	= SONY_ASCOT3_XTAL_16000KHz,
-	// 	.gpio_sc_reset	= 14,
-	//   }
-	// },
+	{ USB_DEVICE(0x0511, 0x084e), .driver_info = (kernel_ulong_t)
+	  &(const struct it930x_board_cfg){	/* PLEX PX-MLT5U */
+		.name		= "PLEX PX-MLT5U",
+		.fw_file	= "it930x-firmware.bin",
+		.num_frontends	= 5,
+		.fe = {
+			{ .ts_port = 4, .i2c_bus = 3,
+			  .demod_addr = 0x65, .tuner_addr = 0x60 },
+			{ .ts_port = 3, .i2c_bus = 1,
+			  .demod_addr = 0x6c, .tuner_addr = 0x60 },
+			{ .ts_port = 1, .i2c_bus = 1,
+			  .demod_addr = 0x64, .tuner_addr = 0x60 },
+			{ .ts_port = 2, .i2c_bus = 3,
+			  .demod_addr = 0x6c, .tuner_addr = 0x60 },
+			{ .ts_port = 0, .i2c_bus = 3,
+			  .demod_addr = 0x64, .tuner_addr = 0x60 },
+		},
+		.gpio_power	= 7,
+		.gpio_reset	= 2,
+		.gpio_lnb	= 11,
+		.tuner_xtal	= SONY_ASCOT3_XTAL_16000KHz,
+		.gpio_sc_reset	= 14,
+		.no_lock_flag	= true,
+		.ts_clk_mask	= 0x03,
+		.ts_ser_half_rate = true,
+		.helene_xosc_load = 0x26,
+		.helene_ter_lna	= true,
+	  }
+	},
+	{ USB_DEVICE(0x0511, 0x024e), .driver_info = (kernel_ulong_t)
+	  &(const struct it930x_board_cfg){	/* PLEX PX-MLT5PE */
+		.name		= "PLEX PX-MLT5PE",
+		.fw_file	= "it930x-firmware.bin",
+		.num_frontends	= 5,
+		.fe = {
+			{ .ts_port = 0, .i2c_bus = 3,
+			  .demod_addr = 0x65, .tuner_addr = 0x60 },
+			{ .ts_port = 1, .i2c_bus = 1,
+			  .demod_addr = 0x6c, .tuner_addr = 0x60 },
+			{ .ts_port = 2, .i2c_bus = 1,
+			  .demod_addr = 0x64, .tuner_addr = 0x60 },
+			{ .ts_port = 3, .i2c_bus = 3,
+			  .demod_addr = 0x6c, .tuner_addr = 0x60 },
+			{ .ts_port = 4, .i2c_bus = 3,
+			  .demod_addr = 0x64, .tuner_addr = 0x60 },
+		},
+		.gpio_power	= 7,
+		.gpio_reset	= 2,
+		.gpio_lnb	= 11,
+		.tuner_xtal	= SONY_ASCOT3_XTAL_16000KHz,
+		.gpio_sc_reset	= 14,
+		.no_lock_flag	= true,
+		.ts_clk_mask	= 0x03,
+		.ts_ser_half_rate = true,
+		.helene_xosc_load = 0x26,
+		.helene_ter_lna	= true,
+	  }
+	},
+	{ USB_DEVICE(0x0511, 0x0252), .driver_info = (kernel_ulong_t)
+	  &(const struct it930x_board_cfg){	/* PLEX PX-MLT8PE3 */
+		.name		= "PLEX PX-MLT8PE3",
+		.fw_file	= "it930x-firmware.bin",
+		.num_frontends	= 3,
+		.fe = {
+			{ .ts_port = 0, .i2c_bus = 3,
+			  .demod_addr = 0x65, .tuner_addr = 0x60 },
+			{ .ts_port = 3, .i2c_bus = 3,
+			  .demod_addr = 0x6c, .tuner_addr = 0x60 },
+			{ .ts_port = 4, .i2c_bus = 3,
+			  .demod_addr = 0x64, .tuner_addr = 0x60 },
+		},
+		.gpio_power	= 7,
+		.gpio_reset	= 2,
+		.gpio_lnb	= 11,
+		.tuner_xtal	= SONY_ASCOT3_XTAL_16000KHz,
+		.gpio_sc_reset	= 14,
+		.no_lock_flag	= true,
+		.ts_clk_mask	= 0x03,
+		.ts_ser_half_rate = true,
+		.helene_xosc_load = 0x26,
+		.helene_ter_lna	= true,
+	  }
+	},
+	{ USB_DEVICE(0x0511, 0x0253), .driver_info = (kernel_ulong_t)
+	  &(const struct it930x_board_cfg){	/* PLEX PX-MLT8PE5 */
+		.name		= "PLEX PX-MLT8PE5",
+		.fw_file	= "it930x-firmware.bin",
+		.num_frontends	= 5,
+		.fe = {
+			{ .ts_port = 0, .i2c_bus = 1,
+			  .demod_addr = 0x65, .tuner_addr = 0x60 },
+			{ .ts_port = 1, .i2c_bus = 1,
+			  .demod_addr = 0x64, .tuner_addr = 0x60 },
+			{ .ts_port = 2, .i2c_bus = 1,
+			  .demod_addr = 0x6c, .tuner_addr = 0x60 },
+			{ .ts_port = 3, .i2c_bus = 3,
+			  .demod_addr = 0x6c, .tuner_addr = 0x60 },
+			{ .ts_port = 4, .i2c_bus = 3,
+			  .demod_addr = 0x64, .tuner_addr = 0x60 },
+		},
+		.gpio_power	= 7,
+		.gpio_reset	= 2,
+		.gpio_lnb	= 11,
+		.tuner_xtal	= SONY_ASCOT3_XTAL_16000KHz,
+		.gpio_sc_reset	= 14,
+		.no_lock_flag	= true,
+		.ts_clk_mask	= 0x03,
+		.ts_ser_half_rate = true,
+		.helene_xosc_load = 0x26,
+		.helene_ter_lna	= true,
+	  }
+	},
+	{ USB_DEVICE(0x0511, 0x0254), .driver_info = (kernel_ulong_t)
+	  &(const struct it930x_board_cfg){	/* Digibest ISDB6014 4TS */
+		.name		= "Digibest ISDB6014 4TS",
+		.fw_file	= "it930x-firmware.bin",
+		.num_frontends	= 4,
+		.fe = {
+			{ .ts_port = 0, .i2c_bus = 3,
+			  .demod_addr = 0x65, .tuner_addr = 0x60 },
+			{ .ts_port = 1, .i2c_bus = 1,
+			  .demod_addr = 0x6c, .tuner_addr = 0x60 },
+			{ .ts_port = 2, .i2c_bus = 1,
+			  .demod_addr = 0x64, .tuner_addr = 0x60 },
+			{ .ts_port = 4, .i2c_bus = 3,
+			  .demod_addr = 0x64, .tuner_addr = 0x60 },
+		},
+		.gpio_power	= 7,
+		.gpio_reset	= 2,
+		.gpio_lnb	= 11,
+		.tuner_xtal	= SONY_ASCOT3_XTAL_16000KHz,
+		.gpio_sc_reset	= 14,
+		.no_lock_flag	= true,
+		.ts_clk_mask	= 0x03,
+		.ts_ser_half_rate = true,
+		.helene_xosc_load = 0x26,
+		.helene_ter_lna	= true,
+	  }
+	},
 	{ }
 };
 MODULE_DEVICE_TABLE(usb, it930x_id_table);

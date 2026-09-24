@@ -8,8 +8,13 @@ Out-of-tree Linux kernel driver for the **Sony CXD28xx** series demodulator and 
 |--------|-----------|-------|-------|-----------|
 | Zenview(GTMEDIA) HDTV Mate | ITE IT930x | CXD2878 | Ascot3 (internal) | 1 (terr/cable) |
 | TurboSight TBS 5530 | Cypress FX2 | CXD2878 + M88RS6060 | Ascot3 + M88RS6060 | 2 (terr/cable + sat) |
+| PLEX PX-MLT5U (`0511:084e`) | ITE IT9305E | CXD2856 ×5 | HELENE (CXD2858ER) | 5 (ISDB-T/ISDB-S each) |
+| PLEX PX-MLT5PE (`0511:024e`) | ITE IT9305E | CXD2856 ×5 | HELENE (CXD2858ER) | 5 (ISDB-T/ISDB-S each) |
+| PLEX PX-MLT8PE3 (`0511:0252`) | ITE IT9305E | CXD2856 ×3 | HELENE (CXD2858ER) | 3 (ISDB-T/ISDB-S each) |
+| PLEX PX-MLT8PE5 (`0511:0253`) | ITE IT9305E | CXD2856 ×5 | HELENE (CXD2858ER) | 5 (ISDB-T/ISDB-S each) |
+| Digibest ISDB6014 / DTV02A-4TS-P (`0511:0254`) | ITE IT9305E | CXD2856 ×4 | HELENE (CXD2858ER) | 4 (ISDB-T/ISDB-S each) |
 
-Both devices support ATSC 3.0 with the ALP network interface.
+Zenview HDTV Mate and TBS 5530 support ATSC 3.0 with the ALP network interface. The PX-MLT family is ISDB-T / ISDB-S only (no `alpN` interface is created).
 
 Zenview HDTV Mate has a Microchip ATECC608 secure element accessible through I2C address `0xc8`.
 
@@ -18,7 +23,7 @@ Zenview HDTV Mate has a Microchip ATECC608 secure element accessible through I2C
 | Module | Description |
 |--------|-------------|
 | `alp.ko` | ATSC A/330 ALP protocol — generic ALP packet parser with segmentation/concatenation reassembly and IPv4 delivery via raw-ip net device (`alp%d`) |
-| `cxd2878.ko` | Sony CXD2878/CXD6801/CXD6802 demodulator + Ascot3/FREIA tuner driver, includes ALP-div-TS decapsulation for ATSC 3.0 |
+| `cxd2878.ko` | Sony CXD2878/CXD6801/CXD6802/CXD2856 demodulator + Ascot3/FREIA/HELENE tuner driver, includes ALP-div-TS decapsulation for ATSC 3.0 |
 | `m88rs6060.ko` | Montage M88RS6060 satellite demod/tuner driver |
 | `it930x.ko` | ITE IT930x USB bridge driver |
 | `tbs5530.ko` | TurboSight TBS 5530 USB bridge driver |
@@ -97,10 +102,42 @@ The following firmware files are required and should be placed in `/lib/firmware
 |--------|----------|
 | Zenview HDTV Mate | `dvb-usb-hdtvmate.fw` |
 | TBS 5530 | `dvb-usb-id5530.fw` |
+| PLEX PX-MLT family, Digibest ISDB6014 | `it930x-firmware.bin` |
 
 For Zenview HDTV Mate, obtain `liba3_phy_sony.so` by downloading the vendor's Android application and extracting the APK. Then use `utils/extract_firmware_hdtvmate.c` to extract the firmware blob from the library. Alternatively, `dvb-usb-it9303-01.fw` from the `linux-firmware` package can be used, but it has slightly worse performance on ATSC 3.0.
 
 For TBS 5530, see [tbsdtv/linux_media/wiki](https://github.com/tbsdtv/linux_media/wiki#firmware).
+
+For the PX-MLT family, `it930x-firmware.bin` is extracted from PLEX's proprietary Windows driver (not redistributable) with the `fwtool` utility from [nns779/px4_drv](https://github.com/nns779/px4_drv):
+
+```sh
+cd px4_drv/fwtool
+make
+wget http://plex-net.co.jp/plex/pxw3u4/pxw3u4_BDA_ver1x64.zip -O pxw3u4_BDA_ver1x64.zip
+unzip -oj pxw3u4_BDA_ver1x64.zip pxw3u4_BDA_ver1x64/PXW3U4.sys
+./fwtool PXW3U4.sys it930x-firmware.bin
+sudo cp it930x-firmware.bin /lib/firmware/
+```
+
+## ISDB-T / ISDB-S (PX-MLT family)
+
+`px4_drv` claims the same USB IDs. Unload and blacklist it before using this driver:
+
+```sh
+sudo modprobe -r px4_drv
+echo "blacklist px4_drv" | sudo tee /etc/modprobe.d/blacklist-px4_drv.conf
+```
+
+Each adapter exposes one frontend supporting both `SYS_ISDBT` and `SYS_ISDBS`; switch with `DTV_DELIVERY_SYSTEM`.
+
+- **ISDB-T**: frequency in Hz, bandwidth defaults to 6 MHz.
+- **ISDB-S**: frequency is the LNB IF frequency in **kHz** (e.g. BS-1 = 1049480), symbol rate is fixed at 28.86 Msps.
+- **ISDB-S `DTV_STREAM_ID`**:
+  - `0`–`7`: relative TS number (slot) within the transponder; no filter (`NO_STREAM_ID_FILTER`) selects slot 0
+  - `8`–`11`: invalid (`EINVAL`)
+  - `12` and above: TSID (e.g. `0x4010`)
+- **LNB power**: on/off only. `SEC_VOLTAGE_13` and `SEC_VOLTAGE_18` both turn the 15 V supply on and `SEC_VOLTAGE_OFF` turns it off. The supply is shared by all tuners on the device and stays on while any frontend requests it. It is switched off when the frontend sleeps.
+- Signal strength is not reported (no RSSI readout for the HELENE tuner). CNR is reported for both systems.
 
 ## ATSC 3.0
 

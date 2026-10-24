@@ -1556,10 +1556,8 @@ static int it930x_start_feed(struct dvb_demux_feed *feed)
 		if (!ret)
 			ret = it930x_pid_filter_set_mode(dev, port, true);
 		mutex_unlock(&dev->io_lock);
-		if (ret) {
-			ife->feeding--;
-			return ret;
-		}
+		if (ret)
+			goto err_unwind;
 		ife->pid_filter_active = true;
 		memset(ife->pid_table, 0xff, sizeof(ife->pid_table));
 	}
@@ -1585,7 +1583,7 @@ static int it930x_start_feed(struct dvb_demux_feed *feed)
 				ret = it930x_pid_filter_add(dev, port, i, pid);
 				mutex_unlock(&dev->io_lock);
 				if (ret)
-					return ret;
+					goto err_unwind;
 				ife->pid_table[i] = pid;
 				break;
 			}
@@ -1593,6 +1591,23 @@ static int it930x_start_feed(struct dvb_demux_feed *feed)
 	}
 
 	return 0;
+
+err_unwind:
+	if (--ife->feeding == 0) {
+		if (ife->pid_filter_active) {
+			mutex_lock(&dev->io_lock);
+			it930x_pid_filter_set_mode(dev, port, false);
+			mutex_unlock(&dev->io_lock);
+			ife->pid_filter_active = false;
+		}
+
+		mutex_lock(&dev->stream_lock);
+		if (--dev->stream_count == 0)
+			it930x_stop_streaming(dev);
+		mutex_unlock(&dev->stream_lock);
+	}
+
+	return ret;
 }
 
 static int it930x_stop_feed(struct dvb_demux_feed *feed)

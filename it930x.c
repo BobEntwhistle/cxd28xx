@@ -2051,7 +2051,7 @@ static long it930x_sc_ioctl(struct file *file, unsigned int cmd,
 			    unsigned long arg)
 {
 	struct it930x_dev *dev = file->private_data;
-	struct it930x_sc_atr atr_data;
+	struct it930x_sc_atr atr_data = { };
 	int present;
 	int ret;
 
